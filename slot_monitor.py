@@ -386,7 +386,9 @@ class SlotHunter:
                 return False
 
             await next_btn.click()
-            await asyncio.sleep(0.5)
+            # Wait long enough for getvscappointmentdates API to respond and
+            # Angular to re-render the calendar before we read DOM state.
+            await asyncio.sleep(10.0)
             self.current_month_index += 1
 
             month, year = await self._get_current_month_year()
@@ -424,6 +426,59 @@ class SlotHunter:
 
         except Exception as e:
             logger.debug(f"Failed to reset to first month: {e}")
+            return False
+
+    async def _navigate_to_month(self, target_month: int, target_year: int) -> bool:
+        """
+        Navigate the calendar to the given month/year by clicking next/prev.
+        Tries up to 24 steps in either direction. Returns True on success.
+        """
+        try:
+            for _ in range(24):
+                cur_month, cur_year = await self._get_current_month_year()
+                if cur_month == target_month and cur_year == target_year:
+                    return True
+
+                cur_total  = cur_year  * 12 + cur_month
+                tgt_total  = target_year * 12 + target_month
+
+                if tgt_total > cur_total:
+                    btn = await self.page.select(self.SELECTORS["next_month"], timeout=2)
+                    if not btn:
+                        break
+                    is_disabled = (
+                        btn.attrs.get('disabled') is not None
+                        or 'disabled' in str(btn.attrs)
+                    )
+                    if is_disabled:
+                        break
+                    await btn.click()
+                    # Give the API time to respond before the next navigation click
+                    await asyncio.sleep(10.0)
+                else:
+                    btn = await self.page.select(self.SELECTORS["prev_month"], timeout=2)
+                    if not btn:
+                        break
+                    is_disabled = (
+                        btn.attrs.get('disabled') is not None
+                        or 'disabled' in str(btn.attrs)
+                    )
+                    if is_disabled:
+                        break
+                    await btn.click()
+                    await asyncio.sleep(10.0)
+
+            cur_month, cur_year = await self._get_current_month_year()
+            success = (cur_month == target_month and cur_year == target_year)
+            if not success:
+                logger.debug(
+                    f"_navigate_to_month: landed on {cur_month}/{cur_year}, "
+                    f"wanted {target_month}/{target_year}"
+                )
+            return success
+
+        except Exception as e:
+            logger.debug(f"_navigate_to_month failed: {e}")
             return False
 
     # ========================================================================
@@ -749,8 +804,12 @@ class SlotHunter:
             remaining = self.max_poll_duration - elapsed
 
             if self.poll_count <= 5 or self.poll_count % 10 == 0:
+                range_str = (
+                    f"{self.date_range[0]} to {self.date_range[1]}"
+                    if self.date_range else "all months"
+                )
                 logger.info(
-                    f"[Poll #{self.poll_count}] Scanning all months... "
+                    f"[Poll #{self.poll_count}] Scanning {range_str} "
                     f"({remaining:.0f}s / {remaining / 60:.1f}min remaining)"
                 )
                 if self.poll_count == 1 or self.poll_count % 10 == 0:
@@ -760,17 +819,69 @@ class SlotHunter:
                     )
 
             try:
-                # Reset to first month
-                await self._go_to_first_month()
-                await asyncio.sleep(0.3)
+                # Navigate to the start of our date range (not the absolute first month)
+                if self.date_range:
+                    start_month, start_year = self.date_range[0].month, self.date_range[0].year
+                else:
+                    today = date.today()
+                    start_month, start_year = today.month, today.year
 
-                # Scan through all available months
+                await self._navigate_to_month(start_month, start_year)
+                await asyncio.sleep(10.0)  # Wait for API response after navigation
+
+                # Compute how many months to scan to cover the full date range
+                if self.date_range:
+                    end = self.date_range[1]
+                    months_to_scan = (end.year - start_year) * 12 + (end.month - start_month) + 1
+                    months_to_scan = max(1, min(months_to_scan, self.max_months))
+                else:
+                    months_to_scan = self.max_months
+
+                # Scan through months within the date range
                 months_scanned = 0
-                for month_idx in range(self.max_months):
+                for month_idx in range(months_to_scan):
                     month, year = await self._get_current_month_year()
 
                     # ---- FAST CHECK ----
                     available_count = await self._get_available_date_count()
+
+                    # ---- CALENDAR STATE LOG ----
+                    try:
+                        cell_summary = await self.page.evaluate("""
+                            (() => {
+                                const cells = document.querySelectorAll('td.datepicker__day');
+                                let disabled = 0, enabled = 0, weekly = 0;
+                                cells.forEach(cell => {
+                                    if (cell.classList.contains('weeklyOff')) { weekly++; return; }
+                                    const btn = cell.querySelector('button.datepicker__button');
+                                    if (!btn) return;
+                                    const isEnabled = btn.hasAttribute('enabled') ||
+                                                      (!btn.hasAttribute('disabled') && !btn.disabled) ||
+                                                      cell.classList.contains('is-enabled');
+                                    if (isEnabled) enabled++; else disabled++;
+                                });
+                                return { total: cells.length, enabled, disabled, weekly };
+                            })()
+                        """)
+                        # Normalise nodriver list response to dict
+                        if isinstance(cell_summary, list):
+                            tmp = {}
+                            for item in cell_summary:
+                                if isinstance(item, list) and len(item) == 2:
+                                    k = item[0]
+                                    v = item[1]
+                                    tmp[k] = v['value'] if isinstance(v, dict) and 'value' in v else v
+                            cell_summary = tmp
+                        if isinstance(cell_summary, dict):
+                            logger.info(
+                                f"[Calendar {month}/{year}] "
+                                f"Total={cell_summary.get('total',0)} | "
+                                f"Available={cell_summary.get('enabled',0)} | "
+                                f"Disabled={cell_summary.get('disabled',0)} | "
+                                f"WeeklyOff={cell_summary.get('weekly',0)}"
+                            )
+                    except Exception:
+                        pass
 
                     if available_count > 0:
                         # Reset failure counter
@@ -809,10 +920,10 @@ class SlotHunter:
                                 f"{self.date_range[0]}–{self.date_range[1]}, skipping..."
                             )
                             months_scanned += 1
-                            if month_idx < self.max_months - 1:
+                            if month_idx < months_to_scan - 1:
                                 if not await self._go_to_next_month():
                                     break
-                                await asyncio.sleep(0.5)
+                                await asyncio.sleep(8.0)
                             continue
 
                         # Build result
@@ -863,10 +974,10 @@ class SlotHunter:
 
                     else:
                         months_scanned += 1
-                        if month_idx < self.max_months - 1:
+                        if month_idx < months_to_scan - 1:
                             if not await self._go_to_next_month():
                                 break
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(8.0)
 
                 # All months scanned — nothing found
                 self._consecutive_empty_polls += 1
