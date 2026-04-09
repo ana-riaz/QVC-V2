@@ -28,8 +28,9 @@ def _preprocess_captcha(image_bytes: bytes) -> bytes:
 
 
 class CaptchaSolver:
-    def __init__(self, capsolver_api_key: str):
+    def __init__(self, capsolver_api_key: str, twocaptcha_api_key: str = ""):
         self.capsolver_api_key = capsolver_api_key
+        self.twocaptcha_api_key = twocaptcha_api_key
         self.ocr = None
         self.ocr_beta = None
         self._client = None
@@ -157,6 +158,59 @@ class CaptchaSolver:
             logger.error(f"CapSolver API failed: {e}")
             return None
     
+    async def solve_2captcha(self, image_base64: str) -> Optional[str]:
+        if not self.twocaptcha_api_key:
+            return None
+        payload = {
+            "clientKey": self.twocaptcha_api_key,
+            "task": {
+                "type": "ImageToTextTask",
+                "body": image_base64,
+                "phrase": False,
+                "case": True,
+                "numeric": 0,
+                "math": False,
+                "minLength": 1,
+                "maxLength": 5,
+                "comment": "enter the text you see on the image"
+            },
+            "languagePool": "en"
+        }
+        try:
+            client = await self._get_client()
+            response = await client.post("https://api.2captcha.com/createTask", json=payload)
+            data = response.json()
+
+            if data.get("errorId", 0) != 0:
+                logger.error(f"2Captcha error: {data.get('errorDescription')}")
+                return None
+
+            task_id = data.get("taskId")
+            if not task_id:
+                logger.error("2Captcha: no taskId in response")
+                return None
+
+            for _ in range(30):
+                await asyncio.sleep(2)
+                result_resp = await client.post(
+                    "https://api.2captcha.com/getTaskResult",
+                    json={"clientKey": self.twocaptcha_api_key, "taskId": task_id}
+                )
+                result = result_resp.json()
+                if result.get("status") == "ready":
+                    text = result.get("solution", {}).get("text")
+                    logger.info(f"2Captcha result: {text}")
+                    return text
+                if result.get("errorId", 0) != 0:
+                    logger.error(f"2Captcha task error: {result}")
+                    return None
+
+            logger.error("2Captcha timeout")
+            return None
+        except Exception as e:
+            logger.error(f"2Captcha API failed: {e}")
+            return None
+
     async def solve(self, image_data: str | bytes, max_retries: int = 3) -> Optional[str]:
 
         # Normalize input
@@ -172,20 +226,28 @@ class CaptchaSolver:
         
         for attempt in range(max_retries):
             logger.info(f"CAPTCHA solve attempt {attempt + 1}/{max_retries}")
-            
-            # Try local OCR first (fast, free)
+
+            # 1st priority: 2Captcha API
+            if self.twocaptcha_api_key:
+                result = await self.solve_2captcha(image_base64)
+                if result:
+                    logger.info(f"2Captcha succeeded: {result}")
+                    return result
+                logger.info("2Captcha failed, trying local OCR...")
+
+            # 2nd: local OCR (fast, free)
             result = self.solve_local(image_bytes)
             if result:
                 logger.info(f"Local OCR succeeded: {result}")
                 return result
-            
-            # Fallback to CapSolver (slower, paid, more accurate)
+
+            # 3rd: CapSolver fallback
             logger.info("Local OCR failed, trying CapSolver...")
             result = await self.solve_capsolver(image_base64)
             if result:
                 logger.info(f"CapSolver succeeded: {result}")
                 return result
-            
+
             logger.warning(f"Attempt {attempt + 1} failed")
         
         logger.error("All CAPTCHA solve attempts exhausted")
