@@ -918,7 +918,7 @@ if __name__ == "__main__":
     print("Press Ctrl+C to stop\n")
 
     uvicorn.run(
-        "web_server:app",
+        app,
         host=host,
         port=port,
         log_level="info",
