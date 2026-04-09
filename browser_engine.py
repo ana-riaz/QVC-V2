@@ -13,7 +13,7 @@ from   nodriver import cdp
 from config import config, selectors, Applicant
 from captcha_solver import CaptchaSolver
 from bandwidth_monitor import bandwidth_monitor
-from proxy_manager import ProxyManager, ProxyConfig
+from proxy_manager import ProxyManager, ProxyConfig, LocalProxyTunnel
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +88,11 @@ class BrowserEngine:
     def __init__(self, proxy_manager: ProxyManager = None):
         self.browser: Optional[uc.Browser] = None
         self.page: Optional[uc.Tab] = None
-        self.solver = CaptchaSolver(config.CAPSOLVER_API_KEY)
+        self.solver = CaptchaSolver(config.CAPSOLVER_API_KEY, config.TWOCAPTCHA_API_KEY)
         self.proxy_manager = proxy_manager
         self._current_proxy: Optional[ProxyConfig] = None
         self._proxy_ext_dir: Optional[str] = None
+        self._local_tunnel: Optional[LocalProxyTunnel] = None
         self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     async def _log_html_snapshot(self, event_name: str, selector: str = None):
@@ -131,13 +132,21 @@ class BrowserEngine:
         if not self._current_proxy:
             return None
         try:
+            # MV2 required: asyncBlocking in onAuthRequired is not supported in MV3 service workers
             manifest = {
                 "version": "1.0.0",
-                "manifest_version": 3,
+                "manifest_version": 2,
                 "name": "Proxy Auth Helper",
-                "permissions": ["proxy", "webRequest", "webRequestAuthProvider"],
-                "host_permissions": ["<all_urls>"],
-                "background": {"service_worker": "background.js"}
+                "permissions": [
+                    "proxy",
+                    "webRequest",
+                    "webRequestBlocking",
+                    "<all_urls>"
+                ],
+                "background": {
+                    "scripts": ["background.js"],
+                    "persistent": True
+                }
             }
             background_js = f"""
 chrome.webRequest.onAuthRequired.addListener(
@@ -164,6 +173,94 @@ chrome.webRequest.onAuthRequired.addListener(
             logger.error(f"Failed to create proxy auth extension: {e}")
             return None
 
+    async def _setup_cors_intercept(self):
+        """
+        Use CDP Fetch response interception to inject Access-Control-Allow-Origin
+        into agent.qatarvisacenter.com responses (both OPTIONS preflight and POST)
+        before Chrome's CORS enforcement runs.
+        The server omits CORS headers when accessed via our residential proxy IP,
+        preventing the slot calendar from loading. This intercepts at the network
+        layer so the page JS receives a valid CORS response without needing
+        --disable-web-security (which breaks other endpoints with 403).
+        Must be called after self.page is set (needs an active tab).
+        """
+        try:
+            tab = self.page  # use the active tab, not browser.main_tab (may be None)
+            if not tab:
+                logger.warning("No active page for CORS intercept setup")
+                return
+
+            # Intercept ALL responses from agent.qatarvisacenter.com so we catch
+            # both OPTIONS preflights and POST requests for getvscappointmentdates.
+            await tab.send(cdp.fetch.enable(
+                patterns=[
+                    cdp.fetch.RequestPattern(
+                        url_pattern="*agent.qatarvisacenter.com*",
+                        request_stage=cdp.fetch.RequestStage.RESPONSE,
+                    )
+                ],
+            ))
+
+            async def _handle_cors(event: cdp.fetch.RequestPaused, connection):
+                try:
+                    if event.response_status_code is None:
+                        # Request-stage pause (shouldn't happen with our pattern) — just continue
+                        await connection.send(cdp.fetch.continue_request(request_id=event.request_id))
+                        return
+
+                    # Keep original headers, replace any existing CORS headers with permissive ones.
+                    # Use continue_response (not fulfill_request) so Chrome keeps the original
+                    # body — no need to re-provide it, and avoids InvalidParams errors on
+                    # unusual response phrases.
+                    cors_strip = {
+                        "access-control-allow-origin",
+                        "access-control-allow-headers",
+                        "access-control-allow-methods",
+                    }
+                    headers = [
+                        h for h in (event.response_headers or [])
+                        if h.name.lower() not in cors_strip
+                    ]
+                    headers += [
+                        cdp.fetch.HeaderEntry(name="Access-Control-Allow-Origin", value="*"),
+                        cdp.fetch.HeaderEntry(name="Access-Control-Allow-Headers", value="*"),
+                        cdp.fetch.HeaderEntry(name="Access-Control-Allow-Methods", value="GET, POST, OPTIONS"),
+                    ]
+
+                    # Chrome 146 requires status+phrase+headers together in continue_response
+                    _phrases = {
+                        200: "OK", 204: "No Content", 206: "Partial Content",
+                        301: "Moved Permanently", 302: "Found", 304: "Not Modified",
+                        400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+                        404: "Not Found", 429: "Too Many Requests",
+                        500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
+                    }
+                    phrase = (event.response_status_text or
+                              _phrases.get(event.response_status_code, "OK"))
+                    await connection.send(cdp.fetch.continue_response(
+                        request_id=event.request_id,
+                        response_code=event.response_status_code,
+                        response_phrase=phrase,
+                        response_headers=headers,
+                    ))
+                    logger.info(
+                        f"CORS injected for agent.qatarvisacenter.com "
+                        f"(HTTP {event.response_status_code})"
+                    )
+
+                except Exception as e:
+                    logger.warning(f"CORS intercept handler error: {e}")
+                    try:
+                        await connection.send(cdp.fetch.continue_request(request_id=event.request_id))
+                    except Exception:
+                        pass
+
+            tab.add_handler(cdp.fetch.RequestPaused, _handle_cors)
+            logger.info("CDP CORS intercept active for getvscappointmentdates")
+
+        except Exception as e:
+            logger.warning(f"CDP CORS intercept setup failed: {e}")
+
     async def _setup_cdp_proxy_auth(self):
         try:
             tab = self.browser.main_tab
@@ -176,28 +273,25 @@ chrome.webRequest.onAuthRequired.addListener(
 
             await tab.send(cdp.fetch.enable(handle_auth_requests=True))
 
-            def _handle_request_paused(event: cdp.fetch.RequestPaused, connection):
+            async def _handle_request_paused(event: cdp.fetch.RequestPaused, connection):
                 try:
-                    asyncio.ensure_future(
-                        connection.send(cdp.fetch.continue_request(request_id=event.request_id))
-                    )
+                    await connection.send(cdp.fetch.continue_request(request_id=event.request_id))
                 except Exception as e:
                     logger.warning(f"Request continue error: {e}")
 
             tab.add_handler(cdp.fetch.RequestPaused, _handle_request_paused)
 
-            def _handle_proxy_auth(event: cdp.fetch.AuthRequired, connection):
+            async def _handle_proxy_auth(event: cdp.fetch.AuthRequired, connection):
                 try:
-                    asyncio.ensure_future(
-                        connection.send(cdp.fetch.continue_with_auth(
-                            request_id=event.request_id,
-                            auth_challenge_response=cdp.fetch.AuthChallengeResponse(
-                                response="ProvideCredentials",
-                                username=username,
-                                password=password
-                            )
-                        ))
-                    )
+                    await connection.send(cdp.fetch.continue_with_auth(
+                        request_id=event.request_id,
+                        auth_challenge_response=cdp.fetch.AuthChallengeResponse(
+                            response="ProvideCredentials",
+                            username=username,
+                            password=password
+                        )
+                    ))
+                    logger.info(f"CDP proxy auth: credentials provided for {event.auth_challenge.origin}")
                 except Exception as e:
                     logger.warning(f"Proxy auth handler error: {e}")
 
@@ -205,9 +299,7 @@ chrome.webRequest.onAuthRequired.addListener(
             logger.info(f"CDP proxy auth handler configured (user: {username})")
 
         except Exception as e:
-            logger.warning(f"CDP proxy auth setup failed: {e} — falling back to extension")
-            if not self._proxy_ext_dir:
-                self._proxy_ext_dir = self._create_proxy_auth_extension()
+            logger.warning(f"CDP proxy auth setup failed: {e}")
 
     async def start(self):
         logger.info("Starting browser...")
@@ -221,6 +313,11 @@ chrome.webRequest.onAuthRequired.addListener(
             "--disable-infobars",
             "--mute-audio",
             "--disable-gpu",
+            # Disable Chrome's Private Network Access checks — without this, Chrome
+            # classifies the page context as 'Loopback' (because it loaded through
+            # our 127.0.0.1 tunnel) and blocks XHR requests to agent.qatarvisacenter.com
+            # with localNetworkAccessRequestPolicy: PermissionBlock.
+            "--disable-features=PrivateNetworkAccessChecks",
         ]
 
         if platform.system() != "Windows":
@@ -235,9 +332,17 @@ chrome.webRequest.onAuthRequired.addListener(
 
         if self.proxy_manager:
             self._current_proxy = self.proxy_manager.current
-            proxy_server = f"http://{self._current_proxy.host}:{self._current_proxy.port}"
-            browser_args.append(f"--proxy-server={proxy_server}")
-            logger.info(f"Proxy configured: {self._current_proxy.host}:{self._current_proxy.port}")
+            # Start a local tunnel so Chrome connects without credentials;
+            # the tunnel injects Proxy-Authorization upstream automatically.
+            self._local_tunnel = LocalProxyTunnel(
+                upstream_host=self._current_proxy.host,
+                upstream_port=self._current_proxy.port,
+                username=self._current_proxy.session_username,
+                password=self._current_proxy.password,
+            )
+            tunnel_port = await self._local_tunnel.start()
+            browser_args.append(f"--proxy-server=http://127.0.0.1:{tunnel_port}")
+            logger.info(f"Proxy tunnel: 127.0.0.1:{tunnel_port} → {self._current_proxy.host}:{self._current_proxy.port}")
             logger.info(f"Session ID: {self._current_proxy.session_id}")
 
         try:
@@ -272,9 +377,6 @@ chrome.webRequest.onAuthRequired.addListener(
                     else:
                         raise
 
-            if self.proxy_manager and self._current_proxy:
-                await self._setup_cdp_proxy_auth()
-
             logger.info(f"Navigating to {config.BASE_URL}...")
             max_nav_retries = 3
 
@@ -284,6 +386,9 @@ chrome.webRequest.onAuthRequired.addListener(
                         self.browser.get(config.BASE_URL, new_tab=False),
                         timeout=30
                     )
+
+                    # Set up CDP CORS intercept now that we have an active page/tab
+                    await self._setup_cors_intercept()
 
                     await asyncio.sleep(8)
 
@@ -365,12 +470,9 @@ chrome.webRequest.onAuthRequired.addListener(
             self.browser = None
             self.page = None
 
-        if self._proxy_ext_dir:
-            try:
-                shutil.rmtree(self._proxy_ext_dir)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup proxy extension: {e}")
-            self._proxy_ext_dir = None
+        if self._local_tunnel:
+            await self._local_tunnel.stop()
+            self._local_tunnel = None
 
     async def restart_with_new_ip(self) -> bool:
         if not self.proxy_manager:
@@ -588,8 +690,12 @@ chrome.webRequest.onAuthRequired.addListener(
         if not await self._select_bs_dropdown("-- Select Country --", country):
             logger.error(f"Failed to select country: {country}")
             return False
-        logger.info(f"Country selected: {country} — waiting for auto-navigation to /home...")
+        logger.info(f"Country selected: {country} — dismissing landing popup if present...")
 
+        # The pk-landing-pop-up.png modal appears after country selection and blocks /home navigation.
+        await self._dismiss_landing_popup()
+
+        logger.info("Waiting for auto-navigation to /home...")
         for i in range(15):
             await asyncio.sleep(1)
             if "/home" in self.page.url:
@@ -599,6 +705,49 @@ chrome.webRequest.onAuthRequired.addListener(
         logger.warning(f"Did not reach /home after 15s (current: {self.page.url}) — continuing anyway")
         return True
 
+    async def _dismiss_landing_popup(self) -> None:
+        """Dismiss the pk-landing-pop-up modal that appears after country selection."""
+        # Wait up to 4s for the modal to render before trying to close it
+        for _ in range(8):
+            await asyncio.sleep(0.5)
+            try:
+                dismissed = await self.page.evaluate("""
+                    (() => {
+                        const closeSelectors = [
+                            'img.mod-close',
+                            'img[alt="close"]',
+                            'img[src*="modal-close"]',
+                            'button.close',
+                            'button[aria-label="Close"]',
+                            '.modal-header button',
+                        ];
+                        for (const sel of closeSelectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.offsetParent !== null) {
+                                el.click();
+                                return 'close-btn:' + sel;
+                            }
+                        }
+                        // Fallback: force-hide any visible modal
+                        const modal = document.querySelector('.modal.show, .modal[style*="display: block"]');
+                        if (modal) {
+                            modal.style.display = 'none';
+                            document.body.classList.remove('modal-open');
+                            const bd = document.querySelector('.modal-backdrop');
+                            if (bd) bd.remove();
+                            return 'force-hide';
+                        }
+                        return null;
+                    })()
+                """)
+                if dismissed:
+                    logger.info(f"Landing popup dismissed ({dismissed})")
+                    await asyncio.sleep(0.5)
+                    return
+            except Exception as e:
+                logger.debug(f"Landing popup dismiss check error: {e}")
+        logger.debug("No landing popup appeared within 4s")
+
     async def _navigate_to_schedule(self) -> bool:
         """
         Step 2: On /home — click the visible 'Book Appointment' card link to go to /schedule.
@@ -606,19 +755,24 @@ chrome.webRequest.onAuthRequired.addListener(
         """
         logger.info("Clicking 'Book Appointment' on /home to navigate to /schedule...")
 
-        clicked = await self.page.evaluate("""
-            (() => {
-                // Prefer the banner card link (most prominent, always visible)
-                const links = document.querySelectorAll('a[href="/schedule"]');
-                for (const a of links) {
-                    if (a.offsetParent !== null) {
-                        a.click();
-                        return true;
+        clicked = False
+        for attempt in range(10):
+            clicked = await self.page.evaluate("""
+                (() => {
+                    const links = document.querySelectorAll('a[href="/schedule"]');
+                    for (const a of links) {
+                        if (a.offsetParent !== null) {
+                            a.click();
+                            return true;
+                        }
                     }
-                }
-                return false;
-            })()
-        """)
+                    return false;
+                })()
+            """)
+            if clicked:
+                break
+            logger.debug(f"Book Appointment link not visible yet (poll {attempt + 1}/10), waiting...")
+            await asyncio.sleep(1)
 
         if not clicked:
             logger.error("Could not find visible 'Book Appointment' link on /home")
@@ -692,7 +846,11 @@ chrome.webRequest.onAuthRequired.addListener(
                     return False
                 await asyncio.sleep(2)
 
-            # Now on /home — click Book Appointment
+            # On /home — dismiss any popup and wait for Angular to render the link
+            await self._dismiss_landing_popup()
+            await self._wait_for('a[href="/schedule"]', timeout=10)
+
+            # Now click Book Appointment
             if not await self._navigate_to_schedule():
                 return False
 
@@ -1113,7 +1271,7 @@ chrome.webRequest.onAuthRequired.addListener(
         self,
         start_date: date,
         end_date: date,
-        poll_interval: float = 2.0,
+        poll_interval: float = 15.0,
         max_duration: int = 3600,
         center: str = "Islamabad"
     ) -> Optional[Tuple[date, str]]:
@@ -1121,6 +1279,9 @@ chrome.webRequest.onAuthRequired.addListener(
         logger.info(f"Poll interval: {poll_interval}s, Max duration: {max_duration}s")
 
         await self._handle_slot_notification_popup()
+
+        # Re-register CORS intercept on the slotdetails page context.
+        await self._setup_cors_intercept()
 
         from slot_monitor import SlotHunter, CapturedSlot
 
@@ -1195,7 +1356,7 @@ chrome.webRequest.onAuthRequired.addListener(
         applicant: Applicant,
         start_date: date,
         end_date: date,
-        poll_interval: float = 2.0,
+        poll_interval: float = 15.0,
         max_hunt_duration: int = 3600,
         center: str = "Islamabad"
     ) -> bool:
