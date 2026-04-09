@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -12,10 +12,12 @@ class Config:
     BASE_URL: str = "https://www.qatarvisacenter.com"
     SCHEDULE_URL: str = "https://www.qatarvisacenter.com/schedule"
     
-    DATE_RANGE_START: date = field(default_factory=lambda: date(2025, 2, 1))
-    DATE_RANGE_END: date = field(default_factory=lambda: date(2025, 3, 31))
+    DATE_RANGE_START: date = field(default_factory=lambda: date.today())
+    DATE_RANGE_END: date = field(default_factory=lambda: date.today() + timedelta(days=45))
     # File pathsc
     EXCEL_PATH: str = "applicants.xlsx"
+    # 2Captcha API (first priority) - Loaded from .env
+    TWOCAPTCHA_API_KEY: str = os.getenv("TWOCAPTCHA_API_KEY", "")
     # CapSolver API (fallback) - Loaded from .env
     CAPSOLVER_API_KEY: str = os.getenv("CAPSOLVER_API_KEY", "")
     # Timing settings
