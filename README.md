@@ -63,6 +63,45 @@ Open **`http://localhost:8000`** in your browser.
 
 ---
 
+## ☁️ AWS EC2 Deployment
+
+Deploy this bot to AWS EC2 for 24/7 operation.
+
+### Quick Deployment
+
+1. **Create an EC2 instance** (Ubuntu 22.04 LTS recommended)
+2. **SSH into the instance**
+3. **Clone this repository**
+4. **Run the setup script**:
+   ```bash
+   bash setup_ec2.sh
+   ```
+5. **Edit `.env`** with your API keys and database URI
+6. **Start the service**:
+   ```bash
+   sudo systemctl start qvc-bot.service
+   ```
+7. **Access dashboard** at `http://<your-ec2-ip>:8000`
+
+### Documentation
+- **Quick Start**: See [QUICK_START_EC2.md](QUICK_START_EC2.md) for fast reference
+- **Full Guide**: See [EC2_DEPLOYMENT.md](EC2_DEPLOYMENT.md) for detailed instructions
+- **Checklist**: See [DEPLOYMENT_CHECKLIST.md](DEPLOYMENT_CHECKLIST.md) for verification
+- **Summary**: See [DEPLOYMENT_SUMMARY.md](DEPLOYMENT_SUMMARY.md) for overview
+
+### Key Features
+- ✅ Auto-start on EC2 reboot (via systemd)
+- ✅ Auto-restart on crash (with 10s retry)
+- ✅ Real-time logs via `journalctl`
+- ✅ Optional Nginx reverse proxy (port 80)
+- ✅ Works with MongoDB Atlas or local MongoDB
+- ✅ Environment-based configuration (no code changes needed)
+
+### Setup Requirements
+No code changes needed! The app works seamlessly on EC2 with proper environment variables configured in `.env`.
+
+---
+
 ## ⌨️ CLI Usage
 
 For power users who prefer the terminal.

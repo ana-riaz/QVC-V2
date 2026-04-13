@@ -1,0 +1,29 @@
+[Unit]
+Description=Qatar Visa Bot Service
+After=network.target
+Wants=network-online.target
+Documentation=file:///home/ubuntu/apps/qvc-v2/EC2_DEPLOYMENT.md
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/apps/qvc-v2
+Environment="PATH=/home/ubuntu/apps/qvc-v2/venv/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/apps/qvc-v2/venv/bin/python web_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits (adjust based on your instance type)
+MemoryLimit=4G
+TasksMax=500
+
+# Security settings
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
