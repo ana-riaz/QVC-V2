@@ -32,8 +32,8 @@ def _find_chrome() -> Optional[str]:
         logger.info(f"Chrome from env: {env_path}")
         return env_path
 
-    for name in ('google-chrome', 'google-chrome-stable', 'chromium-browser',
-                 'chromium', 'chrome', 'chrome.exe'):
+    for name in ('google-chrome', 'google-chrome-stable', 'chromium',
+                 'chromium-browser', 'chrome', 'chrome.exe'):
         found = _shutil.which(name)
         if found:
             logger.info(f"Chrome from PATH: {found}")
@@ -57,8 +57,8 @@ def _find_chrome() -> Optional[str]:
         candidates = [
             '/usr/bin/google-chrome',
             '/usr/bin/google-chrome-stable',
-            '/usr/bin/chromium-browser',
             '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
             '/snap/bin/chromium',
             '/opt/google/chrome/chrome',
             '/opt/google/chrome/google-chrome',
@@ -78,6 +78,28 @@ def _find_chrome() -> Optional[str]:
 def _temp_user_data_dir() -> str:
     base = tempfile.gettempdir()
     return os.path.join(base, f'chrome_uc_{uuid.uuid4().hex[:8]}')
+
+
+def _linux_chrome_fallbacks(primary: Optional[str]) -> list[Optional[str]]:
+    """Return executable candidates ordered for EC2/Linux reliability."""
+    if platform.system() == 'Windows':
+        return [primary]
+
+    candidates: list[Optional[str]] = [primary]
+    for p in [
+        '/usr/bin/chromium',
+        '/usr/lib/chromium/chromium',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium-browser',
+    ]:
+        if p and os.path.isfile(p) and p not in candidates:
+            candidates.append(p)
+
+    # Last resort: let nodriver auto-detect.
+    if None not in candidates:
+        candidates.append(None)
+    return candidates
 
 
 DEBUG_HTML_DIR = os.path.join(os.path.dirname(__file__), "debug_html")
@@ -347,35 +369,46 @@ chrome.webRequest.onAuthRequired.addListener(
 
         try:
             _chrome_path = _find_chrome()
-            _user_data_dir = _temp_user_data_dir()
 
-            browser_config = uc.Config(
-                headless=headless,
-                browser_executable_path=_chrome_path,
-                browser_args=browser_args,
-                sandbox=False,
-                user_data_dir=_user_data_dir
-            )
+            if platform.system() != "Windows" and headless:
+                # Explicitly set modern headless mode for Linux server environments.
+                if "--headless=new" not in browser_args:
+                    browser_args.append("--headless=new")
 
             max_start_retries = 3
-            for attempt in range(max_start_retries):
-                try:
-                    self.browser = await uc.start(config=browser_config)
-                    logger.info(f"Browser process started (attempt {attempt + 1})")
+            executable_candidates = _linux_chrome_fallbacks(_chrome_path)
+            started = False
+            last_error: Optional[Exception] = None
+
+            for executable in executable_candidates:
+                if started:
                     break
-                except Exception as e:
-                    logger.warning(f"Browser start attempt {attempt + 1} failed: {e}")
-                    if attempt < max_start_retries - 1:
+                for attempt in range(max_start_retries):
+                    try:
                         browser_config = uc.Config(
                             headless=headless,
-                            browser_executable_path=_chrome_path,
+                            browser_executable_path=executable,
                             browser_args=browser_args,
                             sandbox=False,
-                            user_data_dir=_temp_user_data_dir()
+                            user_data_dir=_temp_user_data_dir(),
                         )
-                        await asyncio.sleep(2)
-                    else:
-                        raise
+                        self.browser = await uc.start(config=browser_config)
+                        logger.info(
+                            f"Browser process started (exe={executable or 'auto'}, attempt {attempt + 1})"
+                        )
+                        started = True
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(
+                            f"Browser start attempt {attempt + 1} failed "
+                            f"(exe={executable or 'auto'}): {e}"
+                        )
+                        if attempt < max_start_retries - 1:
+                            await asyncio.sleep(2)
+
+            if not started:
+                raise last_error if last_error else RuntimeError("Failed to start browser")
 
             logger.info(f"Navigating to {config.BASE_URL}...")
             max_nav_retries = 3
